@@ -1,0 +1,184 @@
+#include <linux/kernel.h>
+#include <linux/syscalls.h>
+#include <linux/list.h>
+#include <linux/slab.h>
+#include <linux/wait.h>
+#include <linux/uaccess.h>
+#include <linux/spinlock.h>
+#include <linux/sched.h>
+#include <linux/errno.h>
+
+#define MAX_MSG_LEN 4096
+
+struct pubsub_topic {
+    int                topic_id;
+    wait_queue_head_t  wq;
+    char              *msg_buf;   //last message here
+    int                msg_len;   //length of last message
+    spinlock_t         lock;      //to protect the message buffer
+    struct list_head   list;      //linked list head in the global table
+};
+
+//global registry declaration
+static LIST_HEAD(topic_list);
+static DEFINE_SPINLOCK(topic_list_lock);  //to protect the topic_list
+
+//helper function
+static struct pubsub_topic *find_topic(int topic_id)
+{
+    struct pubsub_topic *t;
+
+    list_for_each_entry(t, &topic_list, list) {
+        if (t->topic_id == topic_id)
+            return t;
+    }
+    return NULL;
+}
+
+// sys_create_topic : to create a topic with topic_id defined by user
+//returns 0 on success, negative number on failure
+SYSCALL_DEFINE1(create_topic, int, topic_id)
+{
+    struct pubsub_topic *t;
+    unsigned long flags;
+
+    if (topic_id < 0)
+        return -EINVAL; //invalid arguement returns -22
+
+    /* Check for duplicate */
+    spin_lock_irqsave(&topic_list_lock, flags);
+    if (find_topic(topic_id)) {
+        spin_unlock_irqrestore(&topic_list_lock, flags);
+        return -EEXIST; //using the file exists code here as topic exists, returns -17
+    }
+    spin_unlock_irqrestore(&topic_list_lock, flags);
+
+    /* Allocate and initialise new topic */
+    t = kmalloc(sizeof(*t), GFP_KERNEL);
+    if (!t)
+        return -ENOMEM; //if malloc fails(memory error, etc) returning the Out of Error code here : -12
+
+    t->topic_id = topic_id;
+    t->msg_buf  = NULL;
+    t->msg_len  = 0;
+    init_waitqueue_head(&t->wq);
+    spin_lock_init(&t->lock);
+    INIT_LIST_HEAD(&t->list);
+
+    spin_lock_irqsave(&topic_list_lock, flags);
+    list_add(&t->list, &topic_list);
+    spin_unlock_irqrestore(&topic_list_lock, flags);
+
+    printk(KERN_INFO "pubsub: topic %d created\n", topic_id);
+    return 0;
+}
+
+//sys_subscribe : 3 arguments
+// topic id to subscribe
+// buffer: i am using the __user tag to tell the compiler that the pointer belongst o USER space and cannot be referenced directly by the kernel
+// max_len is the max length
+// it will block the calling process until a message is published on topic_id and then copies it into the user-space buffer.
+//will return number of bytes recieved OR a negative error code based on error type.
+SYSCALL_DEFINE3(subscribe, int, topic_id,
+                char __user *, buffer,
+                int,           max_len)
+{
+    struct pubsub_topic *t;
+    unsigned long flags;
+    DEFINE_WAIT(wait);
+    int ret;
+
+    if (!buffer || max_len <= 0)    //sanity check. if user enters null pointer or impossible length
+        return -EINVAL; //invalid argument
+
+    //looking up topic using our helper function
+    spin_lock_irqsave(&topic_list_lock, flags); //lock that prevents any other core/process from accessing topic list AND disables interrupts on the current core
+    t = find_topic(topic_id);
+    spin_unlock_irqrestore(&topic_list_lock, flags);
+
+    if (!t)
+        return -ENOENT; //no such entry error code
+
+    //join wait queue (of topic) and sleeping till a message is published
+    prepare_to_wait(&t->wq, &wait, TASK_INTERRUPTIBLE);
+
+    spin_lock_irqsave(&t->lock, flags);
+    if (!t->msg_buf) {
+        //no messahe has arrived so unlock and keep waiting.
+        spin_unlock_irqrestore(&t->lock, flags);
+        schedule();         //lets the cpu continue doing things till the publisher wakes up the queue
+        spin_lock_irqsave(&t->lock, flags);
+    }
+
+    finish_wait(&t->wq, &wait); //removes process from the wait queue and then
+
+    //checking if process was interrupted by interrupt signal or message publication
+    if (signal_pending(current)) {
+        spin_unlock_irqrestore(&t->lock, flags);
+        return -EINTR; //returns interrupt error code
+    }
+
+    if (!t->msg_buf) {
+        spin_unlock_irqrestore(&t->lock, flags);
+        return -EAGAIN; //buffer points to memory that cannot be accessed. returns bad address error code
+    }
+
+    //copying buffer to user space
+    ret = min(t->msg_len, max_len);
+    if (copy_to_user(buffer, t->msg_buf, ret)) {
+        spin_unlock_irqrestore(&t->lock, flags);
+        return -EFAULT;
+    }
+
+    spin_unlock_irqrestore(&t->lock, flags);
+
+    printk(KERN_INFO "pubsub: topic %d delivered %d bytes\n",
+           topic_id, ret);
+    return ret;
+}
+//sys_publish
+// copies a message from the user space into the topic buffer and wakes all the subscribers simultaneously
+//returns 0 on sucess and negative error code on failure
+SYSCALL_DEFINE3(publish, int,          topic_id,
+                         char __user *, message,
+                         int,           msg_len)
+{
+    struct pubsub_topic *t;
+    unsigned long flags;
+    char *kbuf;
+
+    if (!message || msg_len <= 0 || msg_len > MAX_MSG_LEN)
+        return -EINVAL;
+
+    //look up topic
+    spin_lock_irqsave(&topic_list_lock, flags);
+    t = find_topic(topic_id);
+    spin_unlock_irqrestore(&topic_list_lock, flags);
+
+    if (!t)
+        return -ENOENT;
+
+    //copying message from user space to kernel space
+    kbuf = kmalloc(msg_len, GFP_KERNEL);
+    if (!kbuf)
+        return -ENOMEM;
+
+    if (copy_from_user(kbuf, message, msg_len)) {
+        kfree(kbuf);
+        return -EFAULT;
+    }
+
+    //swap in new message
+    spin_lock_irqsave(&t->lock, flags);
+    kfree(t->msg_buf);
+    t->msg_buf = kbuf;
+    t->msg_len = msg_len;
+    spin_unlock_irqrestore(&t->lock, flags);
+
+    //wake up all the processes (subscribers) in the wait queue
+    wake_up_all(&t->wq);
+
+    printk(KERN_INFO "pubsub: topic %d published %d bytes\n",
+           topic_id, msg_len);
+    return 0;
+}
