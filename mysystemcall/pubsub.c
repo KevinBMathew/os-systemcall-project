@@ -7,95 +7,107 @@
 #include <linux/spinlock.h>
 #include <linux/sched.h>
 #include <linux/errno.h>
+#include <linux/atomic.h>
 
 #define MAX_MSG_LEN  4096
-#define QUEUE_DEPTH  16     /* messages retained per topic; must be a power of 2 */
-
-/* ── per-message record ──────────────────────────────────────────────────── */
-
-struct pubsub_msg {
-    char         *data;   /* kmalloc'd payload                               */
-    int           len;    /* payload length in bytes                         */
-    unsigned long seq;    /* monotonic sequence number (1-based)             */
-};
-
-/* ── per-topic object ────────────────────────────────────────────────────── */
+#define RING_SIZE    16    //number of messages kept per topic (must be a power of 2)
 
 struct pubsub_topic {
-    int               topic_id;
-    wait_queue_head_t wq;           /* subscriber wait queue                 */
-    spinlock_t        lock;         /* guards all fields below               */
-    struct list_head  list;         /* node in the global topic_list         */
+    int                topic_id;
+    atomic_t           refcount;              //reference count; struct freed when it reaches zero
+    bool               deleted;              //set true by delete_topic so sleeping subscribers bail out
+    wait_queue_head_t  wq;
 
-    /*
-     * Circular message queue.
-     *
-     * Invariant: queue[head] is the oldest valid slot; the newest is at
-     *   (head + count - 1) % QUEUE_DEPTH.
-     * Sequence numbers run 1 .. latest_seq (latest_seq == 0 means nothing
-     *   has been published yet).
-     * The oldest seq still in the buffer is: latest_seq - count + 1.
-     */
-    struct pubsub_msg queue[QUEUE_DEPTH];
-    unsigned int      head;         /* index of oldest slot                  */
-    unsigned int      count;        /* live slots (0 .. QUEUE_DEPTH)         */
-    unsigned long     latest_seq;   /* seq of most-recently published msg    */
+    //circular ring buffer: slot N (0-based) holds the message with pub_seq == N+1
+    char              *ring_data[RING_SIZE];  //per-slot data pointer (NULL if slot unused)
+    int                ring_len[RING_SIZE];   //per-slot message length
+    unsigned long      pub_seq;              //monotonic publish counter; 0 = no messages published yet
+
+    spinlock_t         lock;      //protects ring_data, ring_len, pub_seq, and deleted
+    struct list_head   list;      //linked list node in the global table
 };
 
-/* ── global topic registry ───────────────────────────────────────────────── */
-
+//global registry declaration
 static LIST_HEAD(topic_list);
-static DEFINE_SPINLOCK(topic_list_lock);   /* guards topic_list structure    */
+static DEFINE_SPINLOCK(topic_list_lock);  //protects the topic_list linked list
 
-/* Must be called with topic_list_lock held. */
+// find_topic : raw lookup, MUST be called with topic_list_lock held.
+// Does NOT bump refcount so the pointer is only safe while the lock is held.
 static struct pubsub_topic *find_topic(int topic_id)
 {
     struct pubsub_topic *t;
-    list_for_each_entry(t, &topic_list, list)
+
+    list_for_each_entry(t, &topic_list, list) {
         if (t->topic_id == topic_id)
             return t;
+    }
     return NULL;
 }
 
-/* ── sys_create_topic ────────────────────────────────────────────────────── */
+// find_topic_get : same as find_topic but atomically increments refcount.
+// MUST be called with topic_list_lock held.
+// Returned pointer stays valid until topic_put() is called, even after the
+// caller releases topic_list_lock.
+static struct pubsub_topic *find_topic_get(int topic_id)
+{
+    struct pubsub_topic *t = find_topic(topic_id);
 
+    if (t)
+        atomic_inc(&t->refcount);
+    return t;
+}
+
+// topic_put : drops one reference to t.
+// When the last reference is released, frees all ring buffer slots and
+// the topic struct itself.
+static void topic_put(struct pubsub_topic *t)
+{
+    int i;
+
+    if (atomic_dec_and_test(&t->refcount)) {
+        for (i = 0; i < RING_SIZE; i++)
+            kfree(t->ring_data[i]);  //kfree(NULL) is safe
+        kfree(t);
+    }
+}
+
+// sys_create_topic : creates a topic with the user-supplied topic_id.
+// Returns 0 on success, negative error code on failure.
 SYSCALL_DEFINE1(create_topic, int, topic_id)
 {
     struct pubsub_topic *t;
     unsigned long flags;
+    int i;
 
     if (topic_id < 0)
-        return -EINVAL;
+        return -EINVAL; //invalid argument returns -22
 
-    /*
-     * FIX — TOCTOU race:
-     *
-     * The original code dropped topic_list_lock between the duplicate check
-     * and the list_add, so two concurrent callers could both pass the check
-     * before either inserted.
-     *
-     * New pattern: allocate *before* acquiring the lock (kmalloc may sleep,
-     * so it cannot be called with a spinlock held), then do the duplicate
-     * check and the insertion atomically under a *single* lock acquisition.
-     * If a duplicate is found we free the pre-allocated object and bail.
-     */
+    // allocate and initialise BEFORE taking the list lock because GFP_KERNEL
+    // can sleep; spinlocks must never be held across a sleeping allocation.
     t = kzalloc(sizeof(*t), GFP_KERNEL);
     if (!t)
-        return -ENOMEM;
+        return -ENOMEM; //if malloc fails, returning Out of Memory code: -12
 
-    t->topic_id   = topic_id;
-    t->head       = 0;
-    t->count      = 0;
-    t->latest_seq = 0;   /* 0 == "nothing published yet" sentinel            */
+    t->topic_id = topic_id;
+    atomic_set(&t->refcount, 1);  //the global list holds one reference
+    t->deleted  = false;
+    t->pub_seq  = 0;
+    for (i = 0; i < RING_SIZE; i++) {
+        t->ring_data[i] = NULL;
+        t->ring_len[i]  = 0;
+    }
     init_waitqueue_head(&t->wq);
     spin_lock_init(&t->lock);
     INIT_LIST_HEAD(&t->list);
 
+    // lock, re-check for duplicate, then insert — all in one critical section.
+    // this closes the TOCTOU window the original code had between the unlock
+    // after the duplicate check and the re-lock before the list_add.
     spin_lock_irqsave(&topic_list_lock, flags);
-    if (find_topic(topic_id)) {          /* check + insert in ONE section    */
+    if (find_topic(topic_id)) {
         spin_unlock_irqrestore(&topic_list_lock, flags);
         kfree(t);
-        return -EEXIST;
+        return -EEXIST; //using the file-exists code since the topic already exists: -17
     }
     list_add(&t->list, &topic_list);
     spin_unlock_irqrestore(&topic_list_lock, flags);
@@ -104,215 +116,221 @@ SYSCALL_DEFINE1(create_topic, int, topic_id)
     return 0;
 }
 
-/* ── sys_subscribe ───────────────────────────────────────────────────────── */
-/*
- * New signature — four arguments:
- *
- *   topic_id   topic to read from
- *   buffer     user-space destination buffer
- *   max_len    capacity of buffer in bytes
- *   seq_ptr    IN/OUT pointer to an unsigned long in user space:
- *                 on entry : seq of the last message already received
- *                            (pass 0 on the very first call)
- *                 on exit  : seq of the message just delivered
- *
- * Typical subscriber loop:
- *
- *   unsigned long seq = 0;
- *   char buf[4096];
- *   while (1) {
- *       ssize_t n = syscall(NR_subscribe, id, buf, sizeof(buf), &seq);
- *       if (n > 0) process(buf, n);
- *   }
- *
- * If the subscriber falls behind and messages have been overwritten, it is
- * fast-forwarded to the oldest message still in the buffer.  The caller can
- * detect a gap by checking whether the returned *seq_ptr == old_seq + 1.
- *
- * Returns: number of bytes delivered, or a negative error code.
- */
-SYSCALL_DEFINE4(subscribe,
-                int,                    topic_id,
-                char __user *,          buffer,
-                int,                    max_len,
-                unsigned long __user *, seq_ptr)
+// sys_delete_topic : removes a topic from the global registry.
+// Any subscribers blocked in sys_subscribe will be woken and will return -ENOENT.
+// It is safe to call while subscribers/publishers are active; the struct is freed
+// only once every in-flight syscall drops its reference via topic_put().
+// Returns 0 on success, negative error code on failure.
+SYSCALL_DEFINE1(delete_topic, int, topic_id)
 {
     struct pubsub_topic *t;
-    unsigned long        flags, last_seq, want_seq, oldest_seq, out_seq;
-    unsigned int         idx;
-    char                *tmp;
-    int                  copy_len, ret;
+    unsigned long flags;
 
-    if (!buffer || max_len <= 0 || !seq_ptr)
-        return -EINVAL;
+    if (topic_id < 0)
+        return -EINVAL; //invalid argument returns -22
 
-    /* Read the caller's last-seen sequence number from user space. */
-    if (get_user(last_seq, seq_ptr))
+    // detach from the global list so no new lookups can find it,
+    // but keep the struct alive via the existing list reference until we drop it.
+    spin_lock_irqsave(&topic_list_lock, flags);
+    t = find_topic(topic_id);  //raw lookup is safe here because we hold the list lock
+    if (!t) {
+        spin_unlock_irqrestore(&topic_list_lock, flags);
+        return -ENOENT; //no such entry error code
+    }
+    list_del(&t->list);  //remove from global list; holders of existing refs are unaffected
+    spin_unlock_irqrestore(&topic_list_lock, flags);
+
+    //mark as deleted so any subscriber that wakes up knows to bail out
+    spin_lock_irqsave(&t->lock, flags);
+    t->deleted = true;
+    spin_unlock_irqrestore(&t->lock, flags);
+
+    //wake any sleeping subscribers so they can observe t->deleted and return -ENOENT
+    wake_up_all(&t->wq);
+
+    topic_put(t);  //drop the list's reference; frees struct if no one else holds a ref
+
+    printk(KERN_INFO "pubsub: topic %d deleted\n", topic_id);
+    return 0;
+}
+
+// sys_subscribe : blocks until a message newer than *p_seq arrives on topic_id,
+// then copies it into the user buffer and writes the new sequence number back.
+//
+// Arguments:
+//   topic_id  : topic to subscribe to
+//   buffer    : __user destination buffer for the message bytes
+//   max_len   : capacity of the destination buffer
+//   p_seq     : __user pointer to the subscriber's sequence cursor (in/out).
+//               initialise *p_seq = 0 before the first call; pass the returned
+//               value on every subsequent call.  Each sequence number identifies
+//               one published message uniquely.
+//
+// ROS-style usage: call in a loop until the process exits; each call returns
+// the next available message.  If the subscriber falls more than RING_SIZE
+// publishes behind, it skips ahead to the oldest message still in the ring.
+//
+// Returns number of bytes copied on success, negative error code on failure.
+SYSCALL_DEFINE4(subscribe, int,                   topic_id,
+                            char __user *,         buffer,
+                            int,                   max_len,
+                            unsigned long __user *, p_seq)
+{
+    struct pubsub_topic *t;
+    unsigned long flags, user_seq, read_seq;
+    DEFINE_WAIT(wait);
+    char *kbuf;
+    int ring_idx, copy_len;
+
+    if (!buffer || max_len <= 0 || !p_seq)    //sanity check: null pointer or impossible length
+        return -EINVAL; //invalid argument
+
+    if (get_user(user_seq, p_seq))  //read the subscriber's last-seen sequence number
         return -EFAULT;
 
+    //look up topic and grab a reference so it can't be freed under us
     spin_lock_irqsave(&topic_list_lock, flags);
-    t = find_topic(topic_id);
+    t = find_topic_get(topic_id);
     spin_unlock_irqrestore(&topic_list_lock, flags);
+
     if (!t)
-        return -ENOENT;
+        return -ENOENT; //no such entry error code
 
-    /*
-     * FIX — spurious-wakeup / single-shot sleep:
-     *
-     * The original code called schedule() exactly once inside a plain if().
-     * If the process was woken spuriously (which the scheduler is allowed to
-     * do), it would proceed with msg_buf still NULL and return -EAGAIN,
-     * silently dropping the subscription.
-     *
-     * wait_event_interruptible() wraps the entire prepare_to_wait /
-     * check-condition / schedule / finish_wait sequence in a loop that
-     * re-evaluates the condition after *every* wakeup, so spurious wakeups
-     * are completely harmless.
-     *
-     * READ_ONCE() tells the compiler it must reload latest_seq from memory
-     * on every loop iteration rather than caching it in a register.
-     *
-     * The condition "latest_seq > last_seq" is true as soon as at least one
-     * new message has been published after what the caller already received.
-     */
-    ret = wait_event_interruptible(t->wq,
-                                   READ_ONCE(t->latest_seq) > last_seq);
-    if (ret)            /* woken by a signal (e.g. SIGINT / Ctrl-C)          */
-        return -EINTR;
-
-    /*
-     * FIX — copy_to_user inside a spinlock:
-     *
-     * copy_to_user() may need to handle a page fault to bring a swapped-out
-     * user page back into RAM.  Page-fault handling schedules, which is
-     * illegal inside a spinlock.
-     *
-     * Solution: allocate a temporary kernel-side bounce buffer *before*
-     * taking the lock.  Under the lock we do only a fast kernel→kernel
-     * memcpy (no sleeping possible).  After releasing the lock we call
-     * copy_to_user() safely.
-     */
-    tmp = kmalloc(max_len, GFP_KERNEL);
-    if (!tmp)
+    // pre-allocate a kernel staging buffer so the actual copy_to_user can happen
+    // outside the spinlock.  copy_to_user can sleep on a user-space page fault,
+    // which is illegal while a spinlock is held.
+    kbuf = kmalloc(MAX_MSG_LEN, GFP_KERNEL);
+    if (!kbuf) {
+        topic_put(t);
         return -ENOMEM;
+    }
 
-    spin_lock_irqsave(&t->lock, flags);
+    // wait loop: re-queue on the wait list after every spurious wakeup until a
+    // message with pub_seq > user_seq is genuinely available.
+    // prepare_to_wait sets the task state to TASK_INTERRUPTIBLE BEFORE we check
+    // the condition under the lock, so any wake_up_all() that arrives between
+    // the lock release and schedule() will flip the state back to TASK_RUNNING
+    // and schedule() will return immediately — no wakeup is ever lost.
+    for (;;) {
+        prepare_to_wait(&t->wq, &wait, TASK_INTERRUPTIBLE);
 
-    /* Defensive: the queue could be empty if all messages were evicted. */
-    if (t->count == 0) {
+        spin_lock_irqsave(&t->lock, flags);
+
+        if (t->deleted) {  //topic was deleted while we were sleeping
+            spin_unlock_irqrestore(&t->lock, flags);
+            finish_wait(&t->wq, &wait);
+            kfree(kbuf);
+            topic_put(t);
+            return -ENOENT;
+        }
+
+        if (t->pub_seq > user_seq)  //new message available; exit loop still holding the lock
+            break;
+
         spin_unlock_irqrestore(&t->lock, flags);
-        kfree(tmp);
-        return -EAGAIN;
+
+        if (signal_pending(current)) {  //interrupted by a signal before any message arrived
+            finish_wait(&t->wq, &wait);
+            kfree(kbuf);
+            topic_put(t);
+            return -EINTR; //returns interrupt error code
+        }
+
+        schedule();  //lets the CPU do other work; publisher will wake us via wake_up_all()
     }
 
-    /*
-     * Decide which message to deliver.
-     *
-     * oldest_seq is the sequence number of queue[head] — the least-recently
-     * published message still resident in the ring buffer.
-     */
-    oldest_seq = t->latest_seq - t->count + 1;
-    want_seq   = last_seq + 1;
+    //arrive here holding t->lock with at least one unread message guaranteed
+    finish_wait(&t->wq, &wait);
 
-    if (want_seq < oldest_seq) {
-        /*
-         * The subscriber was too slow.  Messages want_seq .. oldest_seq-1
-         * have already been overwritten.  Jump to the oldest surviving
-         * message; the caller can detect the gap via the returned seq.
-         */
-        want_seq = oldest_seq;
-    }
+    // if the subscriber fell behind by more than RING_SIZE messages, the oldest
+    // slot has already been overwritten; skip ahead to the oldest message still
+    // in the ring rather than reading garbage.
+    if (t->pub_seq - user_seq > RING_SIZE)
+        read_seq = t->pub_seq - RING_SIZE + 1;  //oldest message still in ring
+    else
+        read_seq = user_seq + 1;                //next sequential message
 
-    /* Map sequence number → ring-buffer index. */
-    idx      = (t->head + (unsigned int)(want_seq - oldest_seq)) % QUEUE_DEPTH;
-    copy_len = min(t->queue[idx].len, max_len);
-    memcpy(tmp, t->queue[idx].data, copy_len); /* fast kernel→kernel copy    */
-    out_seq  = t->queue[idx].seq;
+    ring_idx  = (int)((read_seq - 1) % RING_SIZE);  //ring index: seq 1->slot 0, seq 2->slot 1, ...
+    copy_len  = min(t->ring_len[ring_idx], max_len);
+    memcpy(kbuf, t->ring_data[ring_idx], copy_len);  //kernel-to-kernel copy; safe under spinlock
 
     spin_unlock_irqrestore(&t->lock, flags);
 
-    /* Safe to sleep here — we no longer hold the spinlock. */
-    if (copy_to_user(buffer, tmp, copy_len)) {
-        kfree(tmp);
+    //copy staged data to user space now that the spinlock is released
+    if (copy_to_user(buffer, kbuf, copy_len)) {
+        kfree(kbuf);
+        topic_put(t);
         return -EFAULT;
     }
-    kfree(tmp);
 
-    /* Write the delivered sequence number back to the caller. */
-    if (put_user(out_seq, seq_ptr))
+    //write the new sequence number back so the caller knows where to resume
+    if (put_user(read_seq, p_seq)) {
+        kfree(kbuf);
+        topic_put(t);
         return -EFAULT;
+    }
 
-    printk(KERN_INFO "pubsub: topic %d seq %lu -> %d bytes\n",
-           topic_id, out_seq, copy_len);
+    kfree(kbuf);
+    topic_put(t);
+
+    printk(KERN_INFO "pubsub: topic %d seq %lu delivered %d bytes\n",
+           topic_id, read_seq, copy_len);
     return copy_len;
 }
 
-/* ── sys_publish ─────────────────────────────────────────────────────────── */
-/*
- * Unchanged interface, but the backing store is now a ring buffer instead of
- * a single slot, so subscribers that call subscribe() in a tight loop will
- * see every message in order rather than only the latest one.
- *
- * When the ring buffer is full the oldest message is evicted (its data
- * pointer is saved and freed *after* releasing the lock so we don't hold
- * the spinlock during slab work).
- */
-SYSCALL_DEFINE3(publish,
-                int,           topic_id,
-                char __user *, message,
-                int,           msg_len)
+// sys_publish : copies a message from user space into the next ring slot and
+// wakes all subscribers simultaneously.
+// Returns 0 on success, negative error code on failure.
+SYSCALL_DEFINE3(publish, int,          topic_id,
+                         char __user *, message,
+                         int,           msg_len)
 {
     struct pubsub_topic *t;
-    unsigned long        flags;
-    char                *kbuf, *evicted = NULL;
-    unsigned int         slot;
+    unsigned long flags, new_seq;
+    char *kbuf;
+    int ring_idx;
 
     if (!message || msg_len <= 0 || msg_len > MAX_MSG_LEN)
         return -EINVAL;
 
+    //look up topic and grab a reference so it can't be freed under us
     spin_lock_irqsave(&topic_list_lock, flags);
-    t = find_topic(topic_id);
+    t = find_topic_get(topic_id);
     spin_unlock_irqrestore(&topic_list_lock, flags);
+
     if (!t)
         return -ENOENT;
 
+    // copy the message from user space into a kernel buffer BEFORE taking the
+    // topic lock; copy_from_user can sleep on a page fault.
     kbuf = kmalloc(msg_len, GFP_KERNEL);
-    if (!kbuf)
+    if (!kbuf) {
+        topic_put(t);
         return -ENOMEM;
+    }
 
     if (copy_from_user(kbuf, message, msg_len)) {
         kfree(kbuf);
+        topic_put(t);
         return -EFAULT;
     }
 
+    //write into the next ring slot, overwriting the oldest message if the ring is full
     spin_lock_irqsave(&t->lock, flags);
-
-    if (t->count == QUEUE_DEPTH) {
-        /*
-         * Ring buffer is full.  Evict the oldest slot so a slow subscriber
-         * loses the oldest message rather than blocking the publisher.
-         * Save the pointer to free it outside the lock.
-         */
-        evicted              = t->queue[t->head].data;
-        t->queue[t->head].data = NULL;
-        t->head              = (t->head + 1) % QUEUE_DEPTH;
-        t->count--;
-    }
-
-    /* Assign the next slot and stamp it with the next sequence number. */
-    slot                   = (t->head + t->count) % QUEUE_DEPTH;
-    t->latest_seq++;
-    t->queue[slot].data    = kbuf;
-    t->queue[slot].len     = msg_len;
-    t->queue[slot].seq     = t->latest_seq;
-    t->count++;
-
+    ring_idx = (int)(t->pub_seq % RING_SIZE);  //slot to write into (wraps around)
+    kfree(t->ring_data[ring_idx]);             //free the message being evicted from this slot
+    t->ring_data[ring_idx] = kbuf;
+    t->ring_len[ring_idx]  = msg_len;
+    t->pub_seq++;                              //advance monotonic counter; makes message visible
+    new_seq = t->pub_seq;
     spin_unlock_irqrestore(&t->lock, flags);
 
-    kfree(evicted);         /* NULL-safe; frees evicted message outside lock */
+    //wake up all the processes (subscribers) in the wait queue
     wake_up_all(&t->wq);
 
-    printk(KERN_INFO "pubsub: topic %d published seq %lu (%d bytes)\n",
-           topic_id, t->latest_seq, msg_len);
+    topic_put(t);
+
+    printk(KERN_INFO "pubsub: topic %d seq %lu published %d bytes\n",
+           topic_id, new_seq, msg_len);
     return 0;
 }
