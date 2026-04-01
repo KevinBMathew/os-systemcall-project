@@ -23,9 +23,6 @@ OS version information : Fedora 36 VM running kernel version 5.19.8
   - [Final Implementation](#final-implementation)
     - [How This Fixes Prior Problems](#how-this-fixes-prior-problems)
   - [Screenshots of Each Step](#screenshots-of-each-step)
-    - [Building and Installing Kernel](#building-and-installing-kernel)
-    - [Making Custom System Calls Work](#making-custom-system-calls-work)
-    - [Testing](#testing)
 
 ## Method
 This method adds four custom system calls directly into the Linux kernel source tree. Each syscall is defined using the `SYSCALL_DEFINE` macro and registered in the system call table as follows:
@@ -84,48 +81,22 @@ The final implementation adds an `atomic_t refcount` field to `pubsub_topic`. Tw
 
 ## Screenshots of Each Step
 
-### Building and Installing Kernel
+![Kernel before Recompilation](screenshots/original_kernel.png)
 
-**Kernel before recompilation**
+![Building 5.19.8](screenshots/make_successful.png)
 
-![original_kernel](screenshots/original_kernel.png)
+![Installing modules and kernel](screenshots/make_install_successful.png)
 
-**Building 5.19.8**
+![Sucessfully in 5.19.8](screenshots/new_kernel.png)
 
-![make_successful](screenshots/make_successful.png)
+![Makefile for pubsub.c](screenshots/syscall_make.png)
 
-**Installing modules and kernel**
+![Modifying syscall table](screenshots/table_change.png)
 
-![make_install_successful](screenshots/make_install_successful.png)
+![Adding prototype to the Syscall header](screenshots/syscallDotH_change.png)
 
-**Sucessfully in 5.19.8**
+![Basic test with pre-defined topic ID](screenshots/test_basic.png)
 
-![new_kernel](screenshots/new_kernel.png)
+![Test with user-input topic ID](screenshots/test_custom_topic.png)
 
-### Making Custom System Calls Work
-
-**Makefile for pubsub.c**
-
-![syscall_make](screenshots/syscall_make.png)
-
-**Modifying syscall table**
-
-![table_change](screenshots/table_change.png)
-
-**Adding prototype to the Syscall header**
-
-![syscallDotH_change](screenshots/syscallDotH_change.png)
-
-### Testing
-
-**Basic test with pre-defined topic ID**
-
-![test_basic](screenshots/test_basic.png)
-
-**Test with user-input topic ID**
-
-![test_custom_topic](screenshots/test_custom_topic.png)
-
-**Showing Error management**
-
-![test_err_detection](screenshots/test_err_detection.png)
+![Showing Error management](screenshots/test_err_detection.png)

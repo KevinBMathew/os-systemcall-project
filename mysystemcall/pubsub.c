@@ -154,23 +154,9 @@ SYSCALL_DEFINE1(delete_topic, int, topic_id)
     return 0;
 }
 
-// sys_subscribe : blocks until a message newer than *p_seq arrives on topic_id,
-// then copies it into the user buffer and writes the new sequence number back.
-//
-// Arguments:
-//   topic_id  : topic to subscribe to
-//   buffer    : __user destination buffer for the message bytes
-//   max_len   : capacity of the destination buffer
-//   p_seq     : __user pointer to the subscriber's sequence cursor (in/out).
-//               initialise *p_seq = 0 before the first call; pass the returned
-//               value on every subsequent call.  Each sequence number identifies
-//               one published message uniquely.
-//
-// ROS-style usage: call in a loop until the process exits; each call returns
-// the next available message.  If the subscriber falls more than RING_SIZE
-// publishes behind, it skips ahead to the oldest message still in the ring.
-//
-// Returns number of bytes copied on success, negative error code on failure.
+// sys_subscribe : blocks until a message newer than *p_seq arrives on topic_id and copies it into the user buffer.
+//returns number of bytes copied on success, negative error code on failure.
+//p_seq is a user-space pointer to the subscriber's sequence cursor (in/out). we can initialise *p_seq = 0 before the first call; pass the returned value on every subsequent call.  Each sequence number identifies one published message uniquely.
 SYSCALL_DEFINE4(subscribe, int,                   topic_id,
                             char __user *,         buffer,
                             int,                   max_len,
@@ -205,12 +191,8 @@ SYSCALL_DEFINE4(subscribe, int,                   topic_id,
         return -ENOMEM;
     }
 
-    // wait loop: re-queue on the wait list after every spurious wakeup until a
-    // message with pub_seq > user_seq is genuinely available.
-    // prepare_to_wait sets the task state to TASK_INTERRUPTIBLE BEFORE we check
-    // the condition under the lock, so any wake_up_all() that arrives between
-    // the lock release and schedule() will flip the state back to TASK_RUNNING
-    // and schedule() will return immediately — no wakeup is ever lost.
+    //wait loop thathandles spurious wakeups and signals
+    // the loop condition is checked under the lock to avoid missing a wakeup that arrives after the check but before schedule()
     for (;;) {
         prepare_to_wait(&t->wq, &wait, TASK_INTERRUPTIBLE);
 
